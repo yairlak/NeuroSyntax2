@@ -21,8 +21,8 @@ class params:
     def __init__(self):
         self.sfreq = 2000 # Data sampling frequency [Hz]
         self.line_frequency = 60  # Line frequency [Hz]
-        self.tmin = -5  # Start time before event [sec]
-        self.tmax = 1 # End time after event [sec]
+        self.tmin = -2  # Start time before event [sec]
+        self.tmax = 2 # End time after event [sec]
 
 def load_data(settings):
     reader = BlackrockIO(filename=os.path.join(settings.path2data, settings.file_stem), nsx_to_load=3)
@@ -56,32 +56,43 @@ def get_TTLs(TTL_channel, settings):
     events = np.empty([len(TTLs), 3], dtype='int32')
     cnt_word_items = 1 # count number of items in either fixation(should be always one)/sentence/ellptic
     cnt_type = 0 # identify whether fixation/sentence/elliptic
+    cnt_block = 0
     trial = 0 # identifies current trial number
     for i, TTL in enumerate(TTLs):
         # find current block
-        block = np.min(np.where(np.cumsum(num_TTL) >= i+1)) # counting blocks from zero
-        curr_num_items = [1, num_words_sentence[block, trial], num_words_elliptic[block, trial]]
+        #block = np.min(np.where(np.cumsum(num_TTL) >= i+1)) # counting blocks from zero
+        curr_num_items = [1, num_words_sentence[cnt_block, trial], num_words_elliptic[cnt_block, trial]]
+        if curr_num_items[cnt_type] == 0:
+            cnt_word_items, cnt_type, trial, cnt_block = update_counters(cnt_word_items, cnt_type, trial, cnt_block)
         # Generate the current event id. Each block has potenial 100 events (0-99, 100-199, etc.).
         # Within each block, each type (fix/sentence/elliptic) has 30 possible item slots
-        event_id = block * 100 + cnt_type * 30 + cnt_word_items
+        event_id = cnt_block * 100 + cnt_type * 30 + cnt_word_items # For example, event_id = 60 means last word of the sentence
         events[i] = [TTL, 0, event_id]
         # Update counts
-        if cnt_word_items == curr_num_items[cnt_type]:
-            # Change id to last word (=30)
-            event_id = block * 100 + cnt_type * 30 + 30 # For example, event_id = 60 means last word of the sentence
-            events[i] = [TTL, 0, event_id]
-            cnt_type += 1 # forward the type counter
-            cnt_type = cnt_type % 3 # Make sure it is 3-cyclic
-            cnt_word_items = 1 # Start counting the token items from 1
-            if cnt_type == 0:
-                trial += 1
-                trial = trial % 40 # Assuming always 40 trials in each block
+        if cnt_word_items == curr_num_items[cnt_type]: #if last word in sequence
+            event_id = cnt_block * 100 + cnt_type * 30 + 30 # Change id to last word (=30)
+            events[i] = [TTL, 0, event_id] # Change id to last word (=30)
+            cnt_word_items, cnt_type, trial, cnt_block = update_counters(cnt_word_items, cnt_type, trial, cnt_block)
         else:
             cnt_word_items += 1
 
-
+    #TTLs_subset = events[np.argwhere(events[:,2] == 60), 0]
+    #plt.scatter(TTLs, np.ones(len(TTLs)))
+    #plt.scatter(TTLs_subset, np.ones(len(TTLs_subset)), edgecolors = 'r')
+    #plt.show
 
     return events
+
+def update_counters(cnt_word_items, cnt_type, trial, cnt_block):
+    cnt_type += 1  # forward the type counter
+    cnt_type = cnt_type % 3  # Make sure it is 3-cyclic
+    cnt_word_items = 1  # Start counting the token items from 1
+    if cnt_type == 0: # If elliptic finished, and back to fixation then change the trial number
+        trial += 1
+        if trial == 40:  # If last trial (assuming always 40 trials in each block) then increase block number
+            trial = 0
+            cnt_block += 1
+    return cnt_word_items, cnt_type, trial, cnt_block
 
 def generate_mne_raw_object(data_all_channels, params):
     num_channels = data_all_channels.header['signal_channels'].size
@@ -95,30 +106,58 @@ settings = settings()
 # Load parameters (sampling rate, etc.)
 params = params()
 # Load data (BlackRock, Neuralynx, etc.)
+print('Loading data...')
 data_all_channels = load_data(settings)
 # Get TTLs from last channel and generate events mne-object
+print('Collecting TTLs...')
 events = get_TTLs(data_all_channels.nsx_data[2][:,128], settings)
-
 # ---------------------------------------------
 # Epoch the data according to a given event_id
-event_id = 160 # Choose Block, type and word item to lock to
-picks = [1, 20, 30, 40, 50] # Choose channels
+event_ids = [30, 60, 130, 160, 230, 260]  # Choose Block, type and word item to lock to
 # List of freq bands
 #iter_freqs = [('Theta', 4, 7),('Alpha', 8, 12),('Beta', 13, 25),('Gamma', 30, 45), ('High-Gamma', 70, 150)]
 iter_freqs = [('High-Gamma', 70, 150)]
+fstep = 2 # [Hz] Step in spectrogram
 
-for band, fmin, fmax in iter_freqs:
-    # Convert data to mne raw
-    raw = generate_mne_raw_object(data_all_channels, params)
-    raw.notch_filter(params.line_frequency)
+for event_id in event_ids:
+    for band, fmin, fmax in iter_freqs:
+        # Convert data to mne raw
+        print('Generating MNE raw object...')
+        raw = generate_mne_raw_object(data_all_channels, params)
+        raw.notch_filter(params.line_frequency, fir_design='firwin')
 
-    # bandpass filter and compute Hilbert
-    raw.filter(fmin, fmax, n_jobs=1,  # use more jobs to speed up.
-               l_trans_bandwidth=1,  # make sure filter params are the same
-               h_trans_bandwidth=1,  # in each band and skip "auto" option.
-               fir_design='firwin')
-    #raw.apply_hilbert(n_jobs=1, envelope=False)
-    # Epoch data
-    epochs = mne.Epochs(raw, events, event_id, params.tmin, params.tmax, baseline=None, preload=True)
-    # remove evoked response and get analytic signal (envelope)
-    epochs.plot_image(picks = picks)
+        # bandpass filter
+        #raw.filter(fmin, fmax, n_jobs=1,  # use more jobs to speed up.
+        #           l_trans_bandwidth=1,  # make sure filter params are the same
+        #           h_trans_bandwidth=1,  # in each band and skip "auto" option.
+        #           fir_design='firwin')
+        # raw.apply_hilbert(n_jobs=1, envelope=False)
+        # Epoch data
+        epochs = mne.Epochs(raw, events, event_id, params.tmin, params.tmax, baseline=None, preload=True)
+        # remove evoked response and get analytic signal (envelope)
+        for channel in range(128):
+            file_name = 'ERP_Patient_' + settings.file_stem + '_Channel_' + str(channel+1) + '_Event_id' + str(
+                event_id) + '.png'
+            epochs.plot_image(picks=channel, show = False)
+            fig = plt.gcf()
+            fig.savefig(os.path.join('..', 'Figures', file_name))
+            plt.close(fig)
+
+            file_name = 'Spec_Patient_' + settings.file_stem + '_Channel_' + str(channel + 1) + '_Event_id' + str(
+                event_id) + '.png'
+            epochs.plot_psd(picks=[channel], show = False)
+            fig = plt.gcf()
+            fig.savefig(os.path.join('..', 'Figures', file_name))
+            plt.close(fig)
+
+            freqs = np.arange(fmin, fmax, fstep)
+            n_cycles = freqs / 2
+            file_name = 'ERF_Patient_' + settings.file_stem + '_Channel_' + str(channel + 1) + '_Event_id' + str(
+                event_id) + '.png'
+            power = mne.time_frequency.tfr_morlet(epochs, freqs=freqs, average=False, n_cycles=n_cycles, return_itc=False, picks = [channel])
+            power_ave = np.squeeze(np.average(power.data, axis=2))
+            fig, ax = plt.subplots(figsize=(6, 6))
+            map = ax.imshow(power_ave, extent=[np.min(power.times), np.max(power.times), 1, 40], interpolation='nearest', aspect='auto')
+            plt.colorbar(map, label = 'Power')
+            fig.savefig(os.path.join('..', 'Figures', file_name))
+            plt.close(fig)
